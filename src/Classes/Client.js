@@ -10,8 +10,9 @@ const { NodeCache } = require("@cacheable/node-cache");
 const Events = require("../Constant/Events.js");
 const fs = require("node:fs");
 const Functions = require("../Helper/Functions.js");
+const ExtractEventsContent = require("../Handler/ExtractEventsContent.js");
 const Ctx = require("./Ctx.js");
-const Commands = require("../Handler/Commands.js");
+const MessageEventList = require("../Handler/MessageEvents.js");
 const SimplDB = require("simpl.db");
 
 class Client {
@@ -32,6 +33,7 @@ class Client {
         this.markOnlineOnConnect = opts.markOnlineOnConnect ?? true;
         this.prefix = opts.prefix;
         this.selfReply = opts.selfReply ?? false;
+        this.autoMention = opts.autoMention ?? false;
         this.autoAiLabel = opts.autoAiLabel ?? false;
         this.databaseDir = opts.databaseDir;
         this.rawCitation = opts.citation ?? {};
@@ -54,6 +56,8 @@ class Client {
             stdTTL: 30,
             useClones: false
         });
+        this.jidsPath = path.resolve(this.authDir, "jids.json");
+        this.jids = {};
         this.pushnamesPath = path.resolve(this.authDir, "pushnames.json");
         this.pushNames = {};
         this.db = new SimplDB({
@@ -64,22 +68,30 @@ class Client {
         if (typeof this.prefix === "string") this.prefix = this.prefix.split("");
     }
 
+    _saveJids() {
+        fs.writeFileSync(this.jidsPath, JSON.stringify(this.jids));
+    }
+
     _savePushnames() {
         fs.writeFileSync(this.pushnamesPath, JSON.stringify(this.pushNames));
     }
 
-    _runMiddlewares(ctx, index = 0) {
+    async runMiddlewares(ctx, index = 0) {
         const middlewareFn = this.middlewares.get(index);
         if (!middlewareFn) return true;
 
         let nextCalled = false;
-        middlewareFn(ctx, () => {
+        let middlewareCompleted = false;
+
+        await middlewareFn(ctx, async () => {
             if (nextCalled) throw new Error("next() called multiple times in middleware");
             nextCalled = true;
-            return this._runMiddlewares(ctx, index + 1);
+            middlewareCompleted = await this.runMiddlewares(ctx, index + 1);
         });
 
-        return nextCalled;
+        if (!nextCalled && !middlewareCompleted) return false;
+
+        return middlewareCompleted;
     }
 
     use(fn) {
@@ -125,6 +137,14 @@ class Client {
         this.citation = registeredCitation;
     }
 
+    _loadJids() {
+        try {
+            this.jids = JSON.parse(fs.readFileSync(this.jidsPath, "utf8"));
+        } catch {
+            this._saveJids();
+        }
+    }
+
     _loadPushNames() {
         try {
             this.pushNames = JSON.parse(fs.readFileSync(this.pushnamesPath, "utf8"));
@@ -133,30 +153,34 @@ class Client {
         }
     }
 
-    _onEvents() {
-        this.core.ev.on("connection.update", async (update) => {
+    onConnectionUpdate() {
+        this.core.ev.on("connection.update", (update) => {
             this.ev.emit(Events.ConnectionUpdate, update);
             const {
                 connection,
-                lastDisconnect,
-                qr
+                lastDisconnect
             } = update;
 
-            if (qr) this.ev.emit(Events.QR, qr);
+            if (update.qr) this.ev.emit(Events.QR, update.qr);
 
             if (connection === "close") {
                 const shouldReconnect = lastDisconnect.error.output.statusCode !== Baileys.DisconnectReason.loggedOut;
-                this.consolefy.error(`Connection closed: ${lastDisconnect.error}, reconnecting ${shouldReconnect}`);
+                this.consolefy.error(`Connection closed due to ${lastDisconnect.error}, reconnecting ${shouldReconnect}`);
                 if (shouldReconnect) this.launch();
             } else if (connection === "open") {
                 this.readyAt = Date.now();
                 this.ev.emit(Events.ClientReady, this.core);
-                await this._registerCitation();
+                this._registerCitation();
             }
         });
+    }
 
+    onCredsUpdate() {
         this.core.ev.on("creds.update", this.saveCreds);
+    }
 
+    onMessage() {
+        this._loadJids();
         this._loadPushNames();
 
         this.core.ev.on("messages.upsert", async (event) => {
@@ -168,58 +192,88 @@ class Client {
 
                 const messageType = Baileys.getContentType(message.message) ?? "";
                 const text = Functions.getContentFromMsg(message) ?? "";
-                const sender = Baileys.jidNormalizedUser(message.key.participant || message.key.remoteJid);
+                const senderJid = Functions.getSender(message, this.core);
+                const senderLid = await Functions.convertJid("lid", senderJid, this.jids, this.core);
 
-                if (message.pushName && this.pushNames[sender] !== message.pushName) {
-                    this.pushNames[sender] = message.pushName;
-                    this._savePushnames();
+                if (message.pushName && !this.jids[senderLid] || this.jids[senderLid]?.pushName !== message.pushName) {
+                    this.jids[senderLid] = {
+                        ...(this.jids[senderLid] || {}),
+                        pushName: message.pushName
+                    };
+                    if (Baileys.isJidUser(senderJid)) this.jids[senderLid].pn = senderJid;
+                    this._saveJids();
                 }
 
                 const msg = {
                     ...message,
                     content: text,
+                    senderLid,
                     messageType
                 };
+
                 const self = {
                     ...this,
                     m: msg
                 };
+
+                const used = ExtractEventsContent(msg, messageType);
                 const ctx = new Ctx({
-                    used: {
-                        upsert: text
-                    },
+                    used,
                     args: [],
                     self,
                     client: this.core
                 });
 
+                if (MessageEventList[messageType]) await MessageEventList[messageType](msg, this.ev, self, this.core);
                 this.ev.emit(Events.MessagesUpsert, msg, ctx);
                 if (this.readIncomingMsg) await this.core.readMessages([message.key]);
-                await Commands(self, this._runMiddlewares.bind(this));
+                await require("../Handler/Commands.js")(self, this.runMiddlewares.bind(this));
             }
         });
+    }
 
+    onGroupsJoin() {
+        this.core.ev.on("groups.upsert", (event) => {
+            this.ev.emit(Events.GroupsJoin, event);
+        });
+    }
+
+    onGroupsUpdate() {
         this.core.ev.on("groups.update", async ([event]) => {
             await this._setGroupCache(event.id);
         });
+    }
 
+    onGroupParticipantsUpdate() {
         this.core.ev.on("group-participants.update", async (event) => {
             await this._setGroupCache(event.id);
-            this.ev.emit(event.action === "add" ? Events.UserJoin : Events.UserLeave, event);
-        });
 
+            if (event.action === "add") {
+                return this.ev.emit(Events.UserJoin, event);
+            } else if (event.action === "remove") {
+                return this.ev.emit(Events.UserLeave, event);
+            }
+        });
+    }
+
+    onCall() {
         this.core.ev.on("call", (event) => {
-            this.ev.emit(Events.Call, event);
+            const _event = event.map(async (call) => ({
+                ...call,
+                fromLid: await Functions.convertJid("lid", call.from, this.jids, this.core)
+            }));
+            this.ev.emit(Events.Call, _event);
         });
     }
 
     command(opts, code) {
-        if (typeof opts === "string") opts = {
+        if (typeof opts !== "string") return this.cmd.set(this.cmd.size, opts);
+        if (!code) code = () => null;
+
+        return this.cmd.set(this.cmd.size, {
             name: opts,
             code
-        };
-        if (!code) opts.code = () => null;
-        this.cmd.set(this.cmd.size, opts);
+        });
     }
 
     hears(query, callback) {
@@ -229,12 +283,33 @@ class Client {
         });
     }
 
-    getPushName(jid) {
-        return Functions.getPushName(jid, this.pushNames);
+    async groups() {
+        return await this.core.groupFetchAllParticipating();
+    }
+
+    async bio(content) {
+        await this.core.updateProfileStatus(content);
+    }
+
+    async fetchBio(jid) {
+        const decodedJid = Functions.decodeJid(jid ? jid : this.core.user.id);
+        return await this.core.fetchStatus(decodedJid);
+    }
+
+    decodeJid(jid) {
+        return Functions.decodeJid(jid);
+    }
+
+    getPushname(jid) {
+        return Functions.getPushname(jid, this.jids);
     }
 
     getId(jid) {
         return Functions.getId(jid);
+    }
+
+    async convertJid(type, jid) {
+        return await Functions.convertJid(type, jid, this.jids, this.core);
     }
 
     getDb(collection, jid) {
@@ -287,9 +362,14 @@ class Client {
         this.state = state;
         this.saveCreds = saveCreds;
 
-        if (this.useStore) this._initStore();
+        if (this.useStore) {
+            this.store.readFromFile(this.storePath);
+            setInterval(() => {
+                this.store.writeToFile(this.storePath);
+            }, 10_000)
+        }
 
-        const version = this.WAVersion ?? this.fallbackWAVersion;
+        const version = this.WAVersion ? this.WAVersion : this.fallbackWAVersion;
         this.core = Baileys.default({
             version,
             browser: this.browser,
@@ -298,70 +378,80 @@ class Client {
             emitOwnEvents: this.selfReply,
             auth: this.state,
             markOnlineOnConnect: this.markOnlineOnConnect,
+            shouldSyncHistoryMessage: (msg) => {
+                const twoDaysAgo = Date.now() - (2 * 24 * 60 * 60 * 1000);
+                return msg.messageTimestamp * 1000 > twoDaysAgo;
+            },
             cachedGroupMetadata: async (jid) => this.groupCache.get(jid),
-            qrTimeout: this.qrTimeout
+            qrTimeout: this.qrTimeout,
+            msgRetryCounterCache: new NodeCache({
+                stdTTL: 300,
+                checkperiod: 60
+            })
         });
 
-        if (this.useStore) this.store.bind(this.core.ev);
+        if (this.useStore) {
+            this.store.bind(this.core.ev);
 
-        if (this.usePairingCode && !this.core.authState.creds.registered) await this._handlePairingCode();
+            setInterval(() => {
+                const cutoff = Date.now() - (7 * 24 * 60 * 60 * 1000);
+                this.store.cleanupMessages(cutoff);
+            }, 24 * 60 * 60 * 1000)
+        }
+
+        if (this.usePairingCode && !this.core.authState.creds.registered) {
+            this.consolefy.setTag("pairing-code");
+
+            if (this.printQRInTerminal) {
+                this.consolefy.error("If you are set usePairingCode to true then you need to set printQRInTerminal to false.");
+                this.consolefy.resetTag();
+                return;
+            }
+
+            if (!this.phoneNumber) {
+                this.consolefy.error("phoneNumber options are required if you are using usePairingCode.");
+                this.consolefy.resetTag();
+                return;
+            }
+
+            this.phoneNumber = this.phoneNumber.replace(/[^0-9]/g, "");
+
+            if (!this.phoneNumber.length) {
+                this.consolefy.error("Invalid phoneNumber.");
+                this.consolefy.resetTag();
+                return;
+            }
+
+            const res = await fetch("https://gist.githubusercontent.com/itsreimau/3da60a4937a66e4b1ac34970500e926b/raw/5f4a57faf6d0133c37db60192915d4686e865329/PHONENUMBER_MCC.json");
+            const PHONENUMBER_MCC = await res.json();
+
+            if (!Array.isArray(PHONENUMBER_MCC)) {
+                this.consolefy.error("Invalid MCC data received.");
+                this.consolefy.resetTag();
+                return;
+            }
+
+            setTimeout(async () => {
+                const code = this.customPairingCode ? await this.core.requestPairingCode(this.phoneNumber, this.customPairingCode) : await this.core.requestPairingCode(this.phoneNumber);
+
+                this.consolefy.info(`Pairing Code: ${code}`);
+                this.consolefy.resetTag();
+            }, 3000);
+        }
 
         if (!fs.existsSync(this.databaseDir)) fs.mkdirSync(this.databaseDir, {
             recursive: true
         });
 
         setTimeout(() => this._fixUsersDb(), 10000);
-        this._onEvents();
-    }
 
-    _initStore() {
-        this.store.readFromFile(this.storePath);
-        setInterval(() => this.store.writeToFile(this.storePath), 10000);
-
-        this.store.cleanupMessages = (cutoff) => {
-            Object.keys(this.store.messages).forEach((jid) => {
-                this.store.messages[jid] = this.store.messages[jid].filter(
-                    (msg) => msg.messageTimestamp * 1000 > cutoff
-                );
-            });
-        };
-
-        setInterval(() => this.store.cleanupMessages(Date.now() - (7 * 24 * 60 * 60 * 1000)), 24 * 60 * 60 * 1000);
-    }
-
-    async _handlePairingCode() {
-        this.consolefy.setTag("pairing-code");
-
-        if (this.printQRInTerminal) {
-            this.consolefy.error("printQRInTerminal must be false for usePairingCode");
-            this.consolefy.resetTag();
-            return;
-        }
-
-        if (!this.phoneNumber) {
-            this.consolefy.error("phoneNumber is required for usePairingCode");
-            this.consolefy.resetTag();
-            return;
-        }
-
-        this.phoneNumber = this.phoneNumber.replace(/[^0-9]/g, "");
-        if (!this.phoneNumber.length) {
-            this.consolefy.error("Invalid phoneNumber");
-            this.consolefy.resetTag();
-            return;
-        }
-
-        if (!Object.keys(Baileys.PHONENUMBER_MCC).some(mcc => this.phoneNumber.startsWith(mcc))) {
-            this.consolefy.error("phoneNumber format must be like: 62xxx (starts with country code)");
-            this.consolefy.resetTag();
-            return;
-        }
-
-        setTimeout(async () => {
-            const code = this.customPairingCode ? await this.core.requestPairingCode(this.phoneNumber, this.customPairingCode) : await this.core.requestPairingCode(this.phoneNumber);
-            this.consolefy.info(`Pairing Code: ${code}`);
-            this.consolefy.resetTag();
-        }, 3000);
+        this.onConnectionUpdate();
+        this.onCredsUpdate();
+        this.onMessage();
+        this.onGroupsJoin();
+        this.onGroupsUpdate();
+        this.onGroupParticipantsUpdate();
+        this.onCall();
     }
 }
 
