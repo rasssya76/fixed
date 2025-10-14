@@ -15,7 +15,7 @@ const CONTENT_HANDLERS = {
     documentMessageWithCaption: msg => msg.documentMessageWithCaption?.caption || "",
     protocolMessage: msg => getContentFromMsg({
         message: msg.protocolMessage?.editedMessage
-    }) ?? "",
+    }),
     buttonsMessage: msg => msg.buttonsMessage?.contentText || "",
     interactiveMessage: msg => msg.interactiveMessage?.body?.text || "",
     buttonsResponseMessage: msg => msg.buttonsResponseMessage?.selectedButtonId || "",
@@ -31,6 +31,8 @@ const CONTENT_HANDLERS = {
         return text;
     }
 };
+
+const getSender = (msg, client) => msg.key.fromMe ? client.user.id : msg.key.participant || msg.key.remoteJid;
 
 function getContentFromMsg(msg) {
     const contentType = getContentType(msg.message) ?? "";
@@ -59,10 +61,39 @@ function getId(jid) {
     return Baileys.jidDecode(jid)?.user || jid;
 }
 
+const decodeJid = (jid) => {
+    if (/:\d+@/gi.test(jid)) {
+        const decoded = Baileys.jidDecode(jid);
+        return decoded?.user && decoded?.server ? Baileys.jidEncode(decoded.user, decoded.server) : jid;
+    }
+    return jid;
+};
+
+const convertJid = async (type, jid, jids, client) => {
+    const decoced = decodeJid(jid);
+    if (type === "lid" && Baileys.isJidUser(jid)) {
+        for (const [lid, data] of Object.entries(jids)) {
+            if (data.pn === decoced) return lid;
+        }
+        try {
+            const results = await client.onWhatsApp(decoced);
+            if (results && results.length > 0 && results[0].exists) return results[0].jid;
+        } catch {}
+        return decoced;
+    } else if (type === "pn" && Baileys.isLidUser(jid)) {
+        if (jids[decoced] && jids[decoced].pn) return jids[decoced].pn;
+        return decoced;
+    }
+    return decoced;
+};
+
 module.exports = {
     getContentType,
     getContentFromMsg,
     getDb,
     getPushName,
-    getId
+    getId,
+    getSender,
+    convertJid,
+    decodeJid
 };
