@@ -23,7 +23,7 @@
     "@discordjs/collection": "^2.1.1",
     "@mengkodingan/consolefy": "^1.0.1",
     "@neoxr/helper": "^2.3.5",
-    "baileys": "github:Itsukichann/Baileys",
+    "baileys": "github:dcodemaxz/baileys#1308e50",
     "didyoumean": "^1.2.2",
     "glob": "^11.0.3",
     "mime-types": "^2.1.35",
